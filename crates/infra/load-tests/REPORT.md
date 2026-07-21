@@ -139,6 +139,25 @@ represented payment rate ≈ on-chain claim-row rate × A
 
 For example, one million represented payments per second would require roughly 200 payments aggregated into each row at a 5,000-row-per-second settlement rate. That aggregation factor must be measured and stated; it cannot be inferred from the contract benchmark.
 
+### Execution-only throughput by batch size
+
+The following ceilings apply the measured gas costs to a 400M-gas block produced every two seconds. They assume execution is the only constraint; they are not observed end-to-end rates and do not account for DA, state-root processing, or transaction-submission limits.
+
+| Rows | `claim` tx/s | `claim` rows/s | `claim` calldata/row | `claimWithSignature` tx/s | `claimWithSignature` rows/s | Signed calldata/row |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 3,309.01 | 3,309 | 548.0 bytes | 2,763.04 | 2,763 | 708.0 bytes |
+| 10 | 497.07 | 4,971 | 486.8 bytes | 458.20 | 4,582 | 502.8 bytes |
+| 50 | 104.02 | 5,201 | 481.4 bytes | 97.17 | 4,858 | 484.6 bytes |
+| 100 | 52.29 | 5,229 | 480.7 bytes | 48.86 | 4,886 | 482.3 bytes |
+| 150 | 34.91 | 5,236 | 480.5 bytes | 32.59 | 4,888 | 481.5 bytes |
+| 200 | 26.19 | 5,238 | 480.3 bytes | 24.42 | 4,884 | 481.1 bytes |
+| 250 | 20.95 | 5,239 | 480.3 bytes | 19.51 | 4,877 | 480.9 bytes |
+| 300 | 17.46 | 5,238 | 480.2 bytes | 16.23 | 4,868 | 480.8 bytes |
+| 350 | 14.96 | 5,236 | 480.2 bytes | 13.88 | 4,859 | 480.7 bytes |
+| 400 | 13.09 | 5,234 | 480.2 bytes | 12.13 | 4,850 | 480.6 bytes |
+
+The table confirms that 100 rows captures almost all available execution efficiency. Moving from 100 to 250 direct claims improves the execution ceiling by only 0.2%; for signed claims, 100 rows is already slightly more efficient than 250.
+
 The final system limit is the minimum of:
 
 - off-chain voucher creation and validation;
@@ -148,21 +167,33 @@ The final system limit is the minimum of:
 - state-root processing;
 - compressed DA throughput.
 
-## Why one-third of a block is not the limit
+## Mixed-workload devnet result
 
-Base's current full-block budget is about 400M gas, so one third is roughly 133M gas. The per-transaction cap is only 16.8M gas.
+The checked-in devnet workload was rerun with 10 senders, eight rows per signed claim, a 20M gas/s target, and the 90/5/4/1 transaction mix. The 30-second generation window produced 1,780 transactions:
 
-An ordinary transaction therefore cannot consume one third of a Base block. It reaches the transaction cap first, at about 4.2% of the block. For batch settlement, the relevant inclusion boundary is the per-transaction cap measured above.
+| Action | Transactions | Claim rows |
+| --- | ---: | ---: |
+| `claimWithSignature` | 1,595 | 12,760 |
+| ERC-3009 deposit | 101 | — |
+| `settle` | 71 | — |
+| `refund` | 13 | — |
 
-## Recommended benchmark plan
+All 1,780 transactions confirmed, with no submission failures or reverts. The observed aggregate rate was 37.08 tx/s and 9.04M gas/s. Applying the exact claim share to that observed rate gives 33.23 signed claim transactions/s, or **265.8 confirmed claim rows/s**. The transactions carried 6,558,480 bytes of calldata in total, averaging 3,684.5 bytes per transaction.
 
-1. Use 100 rows as the standard reference workload.
-2. Sweep 1, 10, 50, 100, 150, 200, 250, 300, 350, and 400 rows.
-3. Include 438/439 for the direct-claim boundary and 406/407 for the signed-claim boundary.
-4. Report transaction TPS, rows per second, gas per row, calldata per row, and inclusion latency.
-5. Measure compressed batcher output before publishing a DA ceiling.
-6. Run facilitator `/verify` separately for conservative and optimistic server behavior.
-7. State the observed off-chain-payments-per-row aggregation factor before converting settlement rows into payment TPS.
+| Inclusion metric | Minimum | p50 | Mean | p95 | p99 | Maximum |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Block | 670.9 ms | 2.9 s | 6.6 s | 28.3 s | 37.5 s | 40.1 s |
+| Flashblock | 95.4 ms | 1.0 s | 5.2 s | 26.8 s | 35.4 s | 36.9 s |
+
+This run validates transaction construction, ordering, execution, and receipt accounting. It is not a production capacity result: the recovered HA devnet's follower remained at genesis, so the healthy builder was used for both submission and queries. The high tail latency reflects that local environment and should not be used as a Base mainnet latency estimate.
+
+## Measurements still required for a full-stack TPS claim
+
+The devnet batcher exposed input, compressed-output, and submitted-DA counters, but it detected a chain reorganization during the measurement and reset with 1,275 pending blocks and 317 ready channels. That invalidates a before/after compression delta. No compressed-DA ceiling is reported here; it needs a clean, stable run with counter snapshots bracketing only the measured workload.
+
+Facilitator `/verify` was not exercised by this on-chain workload. The conservative path performs signature validation and reads current channel state over RPC. An optimistic server can validate vouchers locally and periodically resynchronize. Those modes need a separate HTTP benchmark with valid voucher payloads, controlled RPC latency, and an explicit resynchronization interval.
+
+The workload also does not model how many off-chain payments are represented by one cumulative voucher row. Until a resource-server test records that aggregation factor, settlement rows/s must not be presented as payment TPS.
 
 ## Sources
 
