@@ -45,9 +45,11 @@ use crate::{
         create_wallet_provider,
     },
     workload::{
-        AccountPool, AerodromeClPayload, B20TransferPayload, CalldataPayload, Erc20Payload,
-        KeyStream, OsakaPayload, PrecompilePayload, SeededRng, StoragePayload, TransferPayload,
-        UniswapV3Payload, WorkloadGenerator,
+        AccountPool, AerodromeClPayload, B20TransferPayload, BatchSettlementClaimPayload,
+        BatchSettlementClaimWithSignaturePayload, BatchSettlementDepositPayload,
+        BatchSettlementRefundPayload, BatchSettlementSettlePayload, CalldataPayload, ChannelBook,
+        Erc20Payload, KeyStream, OsakaPayload, PrecompilePayload, SeededRng, StoragePayload,
+        TransferPayload, UniswapV3Payload, WorkloadGenerator,
     },
 };
 
@@ -82,6 +84,8 @@ pub struct LoadRunner {
     sender_addresses: Vec<String>,
     /// Per-run salt for deriving each sender's own B-20 token, set during B-20 setup.
     pub(super) b20_run_salt: Option<B256>,
+    /// Pre-signed x402 batch-settlement channel artifacts, set during batch-settlement setup.
+    pub(super) batch_settlement_book: Option<Arc<ChannelBook>>,
     recipient_keys: Option<KeyStream>,
     recipient_rng: SeededRng,
 }
@@ -131,7 +135,7 @@ impl LoadRunner {
         let sender_addresses = accounts.accounts().iter().map(|a| a.address.to_string()).collect();
 
         let workload_config = WorkloadConfig::new("load-test").with_seed(config.seed);
-        let generator = Self::create_generator(workload_config, &config, None)?;
+        let generator = Self::create_generator(workload_config, &config, None, None)?;
 
         info!(
             account_count = config.account_count,
@@ -192,6 +196,7 @@ impl LoadRunner {
             funder_address: None,
             sender_addresses,
             b20_run_salt: None,
+            batch_settlement_book: None,
             recipient_keys,
             recipient_rng,
         })
@@ -249,6 +254,7 @@ impl LoadRunner {
         workload_config: WorkloadConfig,
         config: &LoadConfig,
         b20_run_salt: Option<B256>,
+        batch_settlement_book: Option<&Arc<ChannelBook>>,
     ) -> Result<WorkloadGenerator> {
         let mut generator = WorkloadGenerator::new(workload_config);
 
@@ -294,6 +300,49 @@ impl LoadRunner {
                     if let Some(run_salt) = b20_run_salt {
                         generator = generator.with_payload(
                             B20TransferPayload::new(run_salt, U256::from(1000), U256::from(10000)),
+                            weight_pct,
+                        );
+                    }
+                }
+                TxType::BatchSettlementClaimWithSignature => {
+                    // The channel book is only known after batch-settlement setup opens channels
+                    // and pre-signs artifacts; before setup (book None) the payload is not
+                    // installed, mirroring the B-20 pre-setup behavior.
+                    if let Some(book) = batch_settlement_book {
+                        generator = generator.with_payload(
+                            BatchSettlementClaimWithSignaturePayload::new(Arc::clone(book)),
+                            weight_pct,
+                        );
+                    }
+                }
+                TxType::BatchSettlementClaim => {
+                    if let Some(book) = batch_settlement_book {
+                        generator = generator.with_payload(
+                            BatchSettlementClaimPayload::new(Arc::clone(book)),
+                            weight_pct,
+                        );
+                    }
+                }
+                TxType::BatchSettlementDeposit => {
+                    if let Some(book) = batch_settlement_book {
+                        generator = generator.with_payload(
+                            BatchSettlementDepositPayload::new(Arc::clone(book)),
+                            weight_pct,
+                        );
+                    }
+                }
+                TxType::BatchSettlementSettle => {
+                    if let Some(book) = batch_settlement_book {
+                        generator = generator.with_payload(
+                            BatchSettlementSettlePayload::new(Arc::clone(book)),
+                            weight_pct,
+                        );
+                    }
+                }
+                TxType::BatchSettlementRefund => {
+                    if let Some(book) = batch_settlement_book {
+                        generator = generator.with_payload(
+                            BatchSettlementRefundPayload::new(Arc::clone(book)),
                             weight_pct,
                         );
                     }
@@ -354,7 +403,7 @@ impl LoadRunner {
         Ok(generator)
     }
 
-    fn estimate_avg_gas(&self) -> u64 {
+    pub(super) fn estimate_avg_gas(&self) -> u64 {
         let total_weight: u32 = self.config.transactions.iter().map(|t| t.weight).sum();
         if total_weight == 0 {
             return 21_000;
@@ -372,6 +421,27 @@ impl LoadRunner {
                 TxType::Erc20 { .. } => 65_000,
                 TxType::Storage { slots_per_tx, .. } => u64::from(*slots_per_tx) * 22_000 + 21_000,
                 TxType::B20 => 100_000,
+                TxType::BatchSettlementClaimWithSignature => {
+                    let channels_per_claim = self
+                        .config
+                        .batch_settlement
+                        .as_ref()
+                        .map_or(8, |p| p.channels_per_claim as u64);
+                    // Canonical optimized contract, steady-state distinct-receiver fit.
+                    35_000 + channels_per_claim * 29_000
+                }
+                TxType::BatchSettlementClaim => {
+                    let channels_per_claim = self
+                        .config
+                        .batch_settlement
+                        .as_ref()
+                        .map_or(8, |p| p.channels_per_claim as u64);
+                    // Canonical optimized contract, steady-state distinct-receiver fit.
+                    25_000 + channels_per_claim * 26_500
+                }
+                TxType::BatchSettlementDeposit => 167_000,
+                TxType::BatchSettlementSettle => 54_000,
+                TxType::BatchSettlementRefund => 64_000,
                 TxType::Precompile { target, iterations, blake2f_rounds, .. } => {
                     let per_call = match target {
                         PrecompileId::Identity | PrecompileId::Bn254Add => 22_000,
@@ -401,6 +471,47 @@ impl LoadRunner {
         }
 
         weighted_gas / total_weight as u64
+    }
+
+    /// Estimates the weighted-average calldata size (bytes) across the configured transaction mix.
+    ///
+    /// A data-availability proxy (calldata dominates DA cost on Base). Batch-settlement claims scale
+    /// with `channels_per_claim` (each row carries a channel config, cumulative amount, and a 65-byte
+    /// voucher signature), which is the primary DA knob to sweep.
+    fn estimate_avg_calldata_bytes(&self) -> u64 {
+        let total_weight: u32 = self.config.transactions.iter().map(|t| t.weight).sum();
+        if total_weight == 0 {
+            return 0;
+        }
+
+        let channels_per_claim =
+            self.config.batch_settlement.as_ref().map_or(8, |p| p.channels_per_claim as u64);
+        let mut weighted_bytes = 0u64;
+        for tx_config in &self.config.transactions {
+            let bytes = match &tx_config.tx_type {
+                TxType::Transfer => 0,
+                TxType::Calldata { max_size, .. } => *max_size as u64,
+                TxType::Erc20 { .. } | TxType::B20 | TxType::BatchSettlementSettle => 68,
+                TxType::Storage { slots_per_tx, .. } => 4 + u64::from(*slots_per_tx) * 64,
+                TxType::Precompile { .. } | TxType::Osaka { .. } => 100,
+                TxType::UniswapV3 { .. }
+                | TxType::AerodromeCl { .. }
+                | TxType::BatchSettlementRefund => 260,
+                TxType::BatchSettlementClaimWithSignature => {
+                    // A dynamic array of dynamic VoucherClaim tuples includes a 32-byte offset per
+                    // row. Exact ABI length: 228 + 480*n (4,068 bytes for eight rows).
+                    228 + channels_per_claim * 480
+                }
+                // Exact ABI length: 68 + 480*n (3,908 bytes for eight rows).
+                TxType::BatchSettlementClaim => 68 + channels_per_claim * 480,
+                // deposit: channel config + amount + collector + collectorData (validity window,
+                // salt, 65-byte ERC-3009 signature).
+                TxType::BatchSettlementDeposit => 4 + 7 * 32 + 32 + 32 + 320,
+            };
+            weighted_bytes += bytes * tx_config.weight as u64;
+        }
+
+        weighted_bytes / total_weight as u64
     }
 
     /// Funds all accounts from a funding key up to the specified amount.
@@ -746,6 +857,11 @@ impl LoadRunner {
                 | TxType::Erc20 { .. }
                 | TxType::Storage { .. }
                 | TxType::B20
+                | TxType::BatchSettlementClaimWithSignature
+                | TxType::BatchSettlementClaim
+                | TxType::BatchSettlementDeposit
+                | TxType::BatchSettlementSettle
+                | TxType::BatchSettlementRefund
                 | TxType::Precompile { .. }
                 | TxType::Osaka { .. } => {}
             }
@@ -766,6 +882,11 @@ impl LoadRunner {
                 | TxType::Erc20 { .. }
                 | TxType::Storage { .. }
                 | TxType::B20
+                | TxType::BatchSettlementClaimWithSignature
+                | TxType::BatchSettlementClaim
+                | TxType::BatchSettlementDeposit
+                | TxType::BatchSettlementSettle
+                | TxType::BatchSettlementRefund
                 | TxType::Precompile { .. }
                 | TxType::Osaka { .. } => {}
             }
@@ -1063,6 +1184,15 @@ impl LoadRunner {
         {
             return Err(BaselineError::Config(
                 "b20 run salt not set; call setup_b20_tokens before run".into(),
+            ));
+        }
+
+        if self.batch_settlement_book.is_none()
+            && self.config.transactions.iter().any(|t| t.tx_type.is_batch_settlement())
+        {
+            return Err(BaselineError::Config(
+                "batch-settlement channel book not set; call setup_batch_settlement before run"
+                    .into(),
             ));
         }
 
@@ -1544,7 +1674,7 @@ impl LoadRunner {
             );
         }
 
-        let summary = self.collector.summarize_with_fresh_recipient_count(
+        let mut summary = self.collector.summarize_with_fresh_recipient_count(
             last_confirmed_at,
             self.config_summary.clone(),
             self.fresh_recipient_count(),
@@ -1552,6 +1682,22 @@ impl LoadRunner {
         if let Some(fresh_recipient_count) = summary.fresh_recipient_count {
             info!(fresh_recipient_count, "fresh recipient generation complete");
         }
+
+        let calldata_bytes_per_tx = self.estimate_avg_calldata_bytes();
+        summary.calldata_bytes_per_tx = Some(calldata_bytes_per_tx);
+        info!(calldata_bytes_per_tx, "estimated data-availability load per transaction");
+
+        if let Some(book) = &self.batch_settlement_book {
+            let exhausted = book.exhausted_requests();
+            if exhausted > 0 {
+                return Err(BaselineError::Workload(format!(
+                    "x402 batch-settlement pre-signed artifact supply exhausted for {exhausted} \
+                     generated request(s); increase claim_ladder_rungs and/or \
+                     topups_per_channel so the run measures only real x402 operations"
+                )));
+            }
+        }
+
         Ok(summary)
     }
 
