@@ -90,7 +90,7 @@ pub const DEPOSIT_TOPUP_GAS_LIMIT: u64 = 260_000;
 /// protocol boundary.
 #[must_use]
 pub const fn claim_gas_limit(channels_per_claim: usize) -> u64 {
-    let estimated = 120_000 + (channels_per_claim as u64) * 44_000;
+    let estimated = 150_000 + (channels_per_claim as u64) * 47_000;
     if estimated > 16_777_216 { 16_777_216 } else { estimated }
 }
 
@@ -854,8 +854,8 @@ mod tests {
 
     #[test]
     fn claim_gas_limit_is_capped_at_base_transaction_maximum() {
-        assert_eq!(claim_gas_limit(1), 164_000);
-        assert_eq!(claim_gas_limit(100), 4_520_000);
+        assert_eq!(claim_gas_limit(1), 197_000);
+        assert_eq!(claim_gas_limit(100), 4_850_000);
         assert_eq!(claim_gas_limit(400), 16_777_216);
         assert_eq!(claim_gas_limit(1_000), 16_777_216);
     }

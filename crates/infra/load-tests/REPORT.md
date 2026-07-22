@@ -4,18 +4,22 @@ Date: July 22, 2026
 
 ## Summary
 
-The maximum execution-only settlement rates measured were:
+The execution-only ceiling depends strongly on receiver locality. The load tester intentionally assigns a distinct receiver to every channel, while a single merchant can have many payer channels that all update one shared receiver balance.
 
-| Block allocation | Direct `claim` | `claimWithSignature` |
-| --- | ---: | ---: |
-| 100% of a 400M-gas block | **5,032.5 voucher rows/s** at 55 rows/tx | **4,716 voucher rows/s** at 72 rows/tx |
-| 30% of a 400M-gas block | **1,508 voucher rows/s** at 52 rows/tx | **1,414.5 voucher rows/s** at 69 rows/tx |
+| State profile | Block allocation | Direct `claim` | `claimWithSignature` |
+| --- | ---: | ---: | ---: |
+| First claim, distinct receivers | 100% | **4,592 rows/s** | **4,321.5 rows/s** |
+| First claim, distinct receivers | 30% | **1,378 rows/s** | **1,296 rows/s** |
+| Steady state, distinct receivers | 100% | **7,564 rows/s** | **6,853 rows/s** |
+| Steady state, distinct receivers | 30% | **2,262 rows/s** | **2,055 rows/s** |
+| Steady state, one shared receiver | 100% | **9,230 rows/s** | **8,192 rows/s** |
+| Steady state, one shared receiver | 30% | **2,760 rows/s** | **2,457 rows/s** |
 
-These are settled voucher rows per second, not off-chain payment TPS. One cumulative voucher row can represent many payments, but that aggregation factor is application-dependent.
+The checked-in workload uses distinct receivers and advances cumulative claims through a ladder. Its first rung follows the conservative profile; later rungs follow the steady-state distinct-receiver profile. The shared-receiver figures are the maximum gas-only throughput measured.
 
-The practical default remains **100 rows per transaction**. It delivers 5,000 direct rows/s or 4,700 signed rows/s when packed into full blocks—within 0.7% of the measured maxima—while using fewer, larger transactions.
+These are settled voucher rows per second, not off-chain payment TPS; one cumulative row can represent many payments.
 
-The largest representative batches measured below Base's 16,777,216 transaction gas limit were 409 rows for `claim` and 382 rows for `claimWithSignature`. Those are transaction-size boundaries, not throughput optima.
+The practical default remains **100 rows per transaction**. Depending on receiver locality and call path, it is within 0.5–1.2% of the full-block optimum. Tuning the exact batch size mainly reduces unused gas at the end of a block.
 
 ## What was tested
 
@@ -33,7 +37,7 @@ The deployment used the repository's normal `contracts/evm/foundry.toml` setting
 
 This is the same bytecode configuration available to a permissionless deployer following the x402 repository setup. No load-test fixture copy was used for the gas measurements.
 
-Each claim row used:
+The conservative sweep used:
 
 - a distinct funded channel
 - a distinct receiver
@@ -42,28 +46,60 @@ Each claim row used:
 - a valid payer-signed cumulative voucher
 - the first state-changing claim on that channel
 
-The first claim is the conservative case because it writes channel and receiver accounting from zero to non-zero.
+Two steady-state sweeps first claimed every channel in a setup transaction, then explicitly marked settlement storage cold before measuring the next cumulative claim. One kept receivers distinct, matching the load tester. The peak case reused one receiver and token, representative of one merchant claiming from many payer channels.
 
-Reported gas includes contract execution, the 21,000 transaction base cost, and calldata gas. It does not include Base's separate L1 data fee.
+Measurements used pre-encoded calldata and a low-level call under Foundry's `--isolate` mode. `vm.lastCallGas().gasTotalUsed` therefore includes transaction intrinsic gas without charging the test contract's caller-side ABI encoding. Channel addresses, salts, and signatures used representative non-zero values.
 
-The throughput search measured every integer batch size from 1 through 438 in an isolated Foundry test. For each size, it calculated whole transactions that fit into either a 400M-gas block or a 120M-gas (30%) allocation. Channel fields, salts, and signatures used representative non-zero values so calldata gas was not understated by zero-heavy fixtures.
+The method was checked against real Anvil transaction receipts:
+
+| Call | Rows | Isolated measurement | Receipt | Difference |
+| --- | ---: | ---: | ---: | ---: |
+| `claim` | 1 | 65,805 | 65,805 | 0 |
+| `claim` | 100 | 4,361,144 | 4,361,228 | -84 |
+| `claimWithSignature` | 1 | 77,724 | 77,748 | -24 |
+| `claimWithSignature` | 100 | 4,629,550 | 4,629,646 | -96 |
+
+The largest difference was 0.003%. Reported gas includes contract execution, the 21,000 transaction base cost, and calldata gas. It does not include Base's separate L1 data fee.
+
+Every integer batch size through the transaction-cap boundary was measured. Whole transactions were then packed into a 400M-gas block and a 120M-gas (30%) allocation.
+
+Exact packing optima are fixture-specific by a small amount because calldata gas depends on zero bytes in deployed addresses, salts, and signatures. The per-row trend and 100-row results are stable; a different deployment can move a gas-threshold optimum by one transaction.
 
 ## Claim batch-size results
 
 | Rows | `claim` gas | Gas/row | `claimWithSignature` gas | Gas/row |
 | ---: | ---: | ---: | ---: | ---: |
-| 1 | 62,044 | 62,044 | 74,165 | 74,165 |
-| 10 | 414,170 | 41,417 | 448,537 | 44,854 |
-| 50 | 1,987,586 | 39,752 | 2,123,426 | 42,469 |
-| 100 | 3,974,095 | 39,741 | 4,242,951 | 42,430 |
-| 150 | 5,982,876 | 39,886 | 6,391,661 | 42,611 |
-| 200 | 8,014,197 | 40,071 | 8,569,763 | 42,849 |
-| 250 | 10,067,573 | 40,270 | 10,776,854 | 43,107 |
-| 300 | 12,142,816 | 40,476 | 13,012,564 | 43,375 |
-| 350 | 14,240,034 | 40,686 | 15,277,173 | 43,649 |
-| 400 | 16,359,341 | 40,898 | 17,570,773 | 43,927 |
+| 1 | 65,805 | 65,805 | 77,724 | 77,724 |
+| 10 | 455,988 | 45,599 | 490,120 | 49,012 |
+| 50 | 2,190,797 | 43,816 | 2,326,307 | 46,526 |
+| 100 | 4,361,144 | 43,611 | 4,629,550 | 46,296 |
+| 150 | 6,533,501 | 43,557 | 6,941,690 | 46,278 |
+| 200 | 8,708,264 | 43,541 | 9,263,088 | 46,315 |
+| 250 | 10,884,941 | 43,540 | 11,593,298 | 46,373 |
+| 300 | 13,063,556 | 43,545 | 13,932,297 | 46,441 |
+| 350 | 15,244,121 | 43,555 | 16,280,133 | 46,515 |
+| 400 | 17,426,469 | 43,566 | 18,636,639 | 46,592 |
 
-The first 50 rows provide most of the amortization. Gas per row is broadly flat around 50–100 rows, then rises gradually as the dynamic arrays and EIP-712 batch hashing grow. Whole-transaction packing—not a large change in per-row cost—selects 55 direct rows and 72 signed rows as the full-block optima. The difference from 100 rows is small enough that 100 remains a practical default.
+These are first-claim, distinct-receiver costs. Most fixed-cost amortization is complete by 50 rows; gas per row is nearly flat thereafter.
+
+At 100 rows, the state profiles compare as follows:
+
+| State profile | `claim` gas | `claimWithSignature` gas |
+| --- | ---: | ---: |
+| First claim, distinct receivers | 4,361,204 | 4,629,610 |
+| Steady state, distinct receivers | 2,651,120 | 2,919,526 |
+| Steady state, one shared receiver | 2,176,148 | 2,444,554 |
+
+### First claim versus channel reuse
+
+The 1.71M-gas drop from the first to second 100-row distinct-receiver claim is 17,100 gas per row. That gap comes from receiver accounting, not from making the channel slot non-zero:
+
+- `deposit` has already written `ChannelState.balance`. Because `balance` and `totalClaimed` share one packed storage slot, the first claim and later cumulative claims both update an already non-zero channel slot.
+- The first claim writes `receivers[receiver][token].totalClaimed` from zero to non-zero.
+- Reusing the channel changes that receiver slot from non-zero to non-zero, saving 17,100 gas for each distinct receiver row.
+- If rows share a receiver and token, rows after the first also reuse the same warm receiver slot within the transaction. At 100 rows this saves another 474,972 gas relative to steady-state distinct receivers.
+
+This distinction explains the cap change: first-claim batches stop at 385 direct or 360 signed rows, while already-seeded distinct-receiver channels reach 632 or 563 rows. A shared receiver reaches 769 or 667 rows. The current fixed-group load tester must still stay below the first-claim cap because it cannot reach a cheaper later rung if its initial batch is not includable.
 
 `claimWithSignature` has two extra costs:
 
@@ -76,20 +112,27 @@ The second cost is fixed, but the first scales with the number of rows. That is 
 
 Base currently caps ordinary transactions at 16,777,216 gas (`2^24`).
 
-| Call | Largest measured batch below the cap | Gas | Next batch | Gas |
-| --- | ---: | ---: | ---: | ---: |
-| `claim` | 409 | 16,744,412 | 410 | 16,785,859 |
-| `claimWithSignature` | 382 | 16,741,757 | 383 | 16,788,849 |
+| State profile | Call | Largest batch below cap | Gas | Next batch | Gas |
+| --- | --- | ---: | ---: | ---: | ---: |
+| First claim, distinct | `claim` | 385 | 16,772,763 | 386 | 16,815,252 |
+| First claim, distinct | `claimWithSignature` | 360 | 16,750,729 | 361 | 16,798,874 |
+| Steady state, distinct | `claim` | 632 | 16,770,797 | 633 | 16,799,446 |
+| Steady state, distinct | `claimWithSignature` | 563 | 16,754,630 | 564 | 16,783,652 |
+| Steady state, shared | `claim` | 769 | 16,758,717 | 770 | 16,778,460 |
+| Steady state, shared | `claimWithSignature` | 667 | 16,769,625 | 668 | 16,793,912 |
 
 The load tester caps its submitted claim gas limit at `2^24`, so an oversized batch fails at the same boundary rather than requesting a transaction gas limit that Base will reject during validation.
+
+The steady-state boundaries require seeding receiver balances in smaller first-claim transactions. Because the current load tester uses one fixed group size for every ladder rung, its configured batch must remain at or below the first-claim boundary.
 
 For production use:
 
 - **100 rows:** recommended default
-- **55 direct / 72 signed rows:** maximum measured full-block packing
-- **52 direct / 69 signed rows:** maximum measured packing at a 30% block allocation
-- **350 rows:** useful near-limit stress test
-- **409/382 rows:** transaction-cap boundaries only
+- **244 direct / 154 signed rows:** load-test steady-state full-block optima
+- **116 direct / 137 signed rows:** load-test steady-state 30%-allocation optima
+- **260 direct / 128 signed rows:** shared-receiver full-block optima
+- **115 direct / 126 signed rows:** shared-receiver 30%-allocation optima
+- Transaction-cap boundaries are stress-test values only.
 
 ## Gas cost by action
 
@@ -99,8 +142,8 @@ Deposit, refund, and settlement measurements used a Base mainnet fork at block `
 | --- | ---: | --- |
 | ERC-3009 deposit | 166,592 | First deposit on a new channel, real Base USDC authorization |
 | Permit2 deposit | 154,844 | First deposit on a new channel, real Permit2 witness transfer and Base USDC |
-| `claim[1]` | 62,044 | Direct receiver-side claim |
-| `claimWithSignature[1]` | 74,165 | Relay-friendly claim with receiver-authorizer batch signature |
+| `claim[1]` | 65,805 | Direct receiver-side claim, receipt-validated |
+| `claimWithSignature[1]` | 77,748 | Relay-friendly claim, receipt-validated |
 | `refund` | 63,314 | Direct receiver-side full refund using Base USDC |
 | `settle` | 53,340 | One claimed balance transferred as Base USDC |
 
@@ -132,7 +175,7 @@ Raw calldata is a useful upper-bound proxy for data availability load, but it is
 
 ## What the result means for throughput
 
-At roughly 40–44k gas per first-claim row, a 400M-gas block has an execution-only ceiling near 10,000 claim rows per block, or about 5,000 rows per second at two-second blocks.
+The first claim on fresh receiver balances fits 8,643–9,184 rows in a 400M-gas block. Once those balances are non-zero, the checked-in distinct-receiver workload fits 13,706–15,128 rows. Sharing one receiver raises the range to 16,384–18,460 rows.
 
 That is not yet a full-stack x402 TPS number. A `VoucherClaim` row is the latest cumulative state for one channel. It can replace many earlier off-chain payment vouchers. If each on-chain row aggregates `A` payments, then:
 
@@ -140,35 +183,30 @@ That is not yet a full-stack x402 TPS number. A `VoucherClaim` row is the latest
 represented payment rate ≈ on-chain claim-row rate × A
 ```
 
-For example, one million represented payments per second would require about 199 payments per direct-claim row or 212 payments per signed-claim row at the full-block rates measured here. That aggregation factor must be measured and stated; it cannot be inferred from the contract benchmark.
+For one million represented payments per second, the steady-state aggregation requirement is about 109–123 payments per row with a shared receiver, or 132–146 with distinct receivers. That factor must be measured in the resource-server workload; it cannot be inferred from this contract benchmark.
 
-### Execution-only throughput by batch size
+### Exact block-packing results
 
-The following ceilings apply the measured gas costs to a 400M-gas block produced every two seconds. They assume execution is the only constraint; they are not observed end-to-end rates and do not account for DA, state-root processing, or transaction-submission limits.
+The following are gas-only ceilings for 400M-gas, two-second blocks. They use whole transactions and enforce Base's 16,777,216 per-transaction limit.
 
-| Rows | `claim` tx/s | `claim` rows/s | `claim` calldata/row | `claimWithSignature` tx/s | `claimWithSignature` rows/s | Signed calldata/row |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 3,223.52 | 3,224 | 548.0 bytes | 2,696.69 | 2,697 | 708.0 bytes |
-| 10 | 482.89 | 4,829 | 486.8 bytes | 445.89 | 4,459 | 502.8 bytes |
-| 50 | 100.62 | 5,031 | 481.4 bytes | 94.19 | 4,709 | 484.6 bytes |
-| 100 | 50.33 | 5,033 | 480.7 bytes | 47.14 | 4,714 | 482.3 bytes |
-| 150 | 33.43 | 5,014 | 480.5 bytes | 31.29 | 4,694 | 481.5 bytes |
-| 200 | 24.96 | 4,991 | 480.3 bytes | 23.34 | 4,668 | 481.1 bytes |
-| 250 | 19.87 | 4,966 | 480.3 bytes | 18.56 | 4,640 | 480.9 bytes |
-| 300 | 16.47 | 4,941 | 480.2 bytes | 15.37 | 4,611 | 480.8 bytes |
-| 350 | 14.04 | 4,916 | 480.2 bytes | 13.09 | 4,582 | 480.7 bytes |
-| 400 | 12.23 | 4,890 | 480.2 bytes | — | — | 480.6 bytes |
+| State profile | Call | Allocation | Rows/tx | Gas/tx | Tx/block | Rows/block | Rows/s |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| First distinct | `claim` | 100% | 164 | 7,142,176 | 56 | 9,184 | **4,592** |
+| First distinct | `claim` | 30% | 212 | 9,230,446 | 13 | 2,756 | **1,378** |
+| First distinct | `claimWithSignature` | 100% | 129 | 5,969,772 | 67 | 8,643 | **4,321.5** |
+| First distinct | `claimWithSignature` | 30% | 108 | 4,998,864 | 24 | 2,592 | **1,296** |
+| Steady distinct | `claim` | 100% | 244 | 6,451,394 | 62 | 15,128 | **7,564** |
+| Steady distinct | `claim` | 30% | 116 | 3,072,454 | 39 | 4,524 | **2,262** |
+| Steady distinct | `claimWithSignature` | 100% | 154 | 4,493,772 | 89 | 13,706 | **6,853** |
+| Steady distinct | `claimWithSignature` | 30% | 137 | 3,997,346 | 30 | 4,110 | **2,055** |
+| Steady shared | `claim` | 100% | 260 | 5,631,652 | 71 | 18,460 | **9,230** |
+| Steady shared | `claim` | 30% | 115 | 2,499,472 | 48 | 5,520 | **2,760** |
+| Steady shared | `claimWithSignature` | 100% | 128 | 3,124,991 | 128 | 16,384 | **8,192** |
+| Steady shared | `claimWithSignature` | 30% | 126 | 3,076,304 | 39 | 4,914 | **2,457** |
 
-Those rates divide a continuous 200M gas/s budget by one transaction's measured gas. Real blocks contain whole transactions, so the exhaustive packing search gives the more precise maxima:
+At 100 rows per transaction, full-block throughput is 7,500 direct or 6,850 signed rows/s for the steady distinct-receiver workload, and 9,150 direct or 8,150 signed rows/s with a shared receiver. The simpler 100-row default is close to every steady-state optimum.
 
-| Call | Allocation | Rows/tx | Gas/tx | Tx/block | Rows/block | Rows/s |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `claim` | 100% | 55 | 2,185,421 | 183 | 10,065 | **5,032.5** |
-| `claim` | 30% | 52 | 2,066,635 | 58 | 3,016 | **1,508** |
-| `claimWithSignature` | 100% | 72 | 3,052,518 | 131 | 9,432 | **4,716** |
-| `claimWithSignature` | 30% | 69 | 2,925,709 | 41 | 2,829 | **1,414.5** |
-
-The selected configurations use 99.9% or more of their assigned gas budgets. A 100-row default packs 10,000 direct rows or 9,400 signed rows into a full block, so tuning batch size improves maximum throughput by only 0.65% and 0.34%, respectively.
+Raw calldata at the full-block optima is approximately 6.6–7.3 MB for the steady distinct-receiver workload and 7.9–8.9 MB for the shared-receiver peak before OP Stack compression. Execution gas is not automatically the final bottleneck; DA and state-root processing still need independent measurements.
 
 The final system limit is the minimum of:
 

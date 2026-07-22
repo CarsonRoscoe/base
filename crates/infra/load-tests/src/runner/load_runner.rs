@@ -427,8 +427,8 @@ impl LoadRunner {
                         .batch_settlement
                         .as_ref()
                         .map_or(8, |p| p.channels_per_claim as u64);
-                    // Canonical optimized contract, conservative first-claim fit.
-                    60_000 + channels_per_claim * 43_500
+                    // Canonical optimized contract, steady-state distinct-receiver fit.
+                    35_000 + channels_per_claim * 29_000
                 }
                 TxType::BatchSettlementClaim => {
                     let channels_per_claim = self
@@ -436,8 +436,8 @@ impl LoadRunner {
                         .batch_settlement
                         .as_ref()
                         .map_or(8, |p| p.channels_per_claim as u64);
-                    // Canonical optimized contract, conservative first-claim fit.
-                    50_000 + channels_per_claim * 41_000
+                    // Canonical optimized contract, steady-state distinct-receiver fit.
+                    25_000 + channels_per_claim * 26_500
                 }
                 TxType::BatchSettlementDeposit => 167_000,
                 TxType::BatchSettlementSettle => 54_000,
